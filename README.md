@@ -4,7 +4,7 @@ All code used to analyse data and prepare figures for Stuart, O. et al. (2024) "
 
 The code is contained in the "Analysis" folder and is divided into two `.Rmd` files.
 
-- `LHISI_Phenotype_Data_Cleaning.Rmd`: here I make some quick summaries of the phenotypic measurements taken from ZIMS and clean any obvious errors.
+- `LHISI_Phenotype_Data_Cleaning.Rmd`: here I make some quick summaries of the phenotypic measurements taken from ZIMS and clean any obvious errors. This script generates the input file for the next `.Rmd` file: `Data/cleaned_phenotype_data.Rdata` which is included in this repository
 - `LHISI_Phenotype_Data_Modelling.Rmd`: all actual modelling and plotting goes here.
 
-The raw data used for both of these analysis scripts is available on request: oliver.stuart93@gmail.com
+The raw data used as input for `LHISI_Phenotype_Data_Cleaning.Rmd` is available on request: oliver.stuart93@gmail.com
