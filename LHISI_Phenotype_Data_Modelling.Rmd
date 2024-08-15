@@ -1,0 +1,1903 @@
+---
+title: "LHISI Phenotype Data - Modelling"
+output: html_document
+---
+
+```{r setup, echo=FALSE,include=F}
+library(knitr)
+opts_chunk$set(echo = TRUE,
+               warning = FALSE,
+               message = FALSE,
+               fig.width=12, fig.height=8)
+```
+
+# Preface {.tabset}
+
+This document contains all data modelling of the *Dryococelus australis* phenotype data. Previously, we loaded and cleaned the data and produced some graphical summaries.
+
+## Setup
+
+### StanHeaders
+
+First, we may have to reinstall StanHeaders.
+
+```{r reinstall_stanheaders, warning=F,eval=F}
+install.packages("StanHeaders")
+```
+
+### Library loading
+
+```{r library_loading, warning=FALSE,messsage=FALSE}
+library(dplyr,        warn.conflicts = F)
+library(magrittr,     warn.conflicts = F)
+library(ggplot2,      warn.conflicts = F)
+library(cowplot,      warn.conflicts = F)
+library(RColorBrewer, warn.conflicts = F)
+library(patchwork,    warn.conflicts = F)
+library(brms,         warn.conflicts = F)
+library(tidybayes,    warn.conflicts = F)
+library(modelr,       warn.conflicts = F)
+library(ggpubr,       warn.conflicts = F)
+library(forcats,      warn.conflicts = F)
+```
+
+### Working directory
+
+```{r set_environment}
+source("../config.R")
+setwd(WORKING_DIR)
+```
+
+### Import data
+
+```{r get_data}
+load(file=paste0(DATA_DIR,"/cleaned_phenotype_data.R"))
+adameve_cutoff <- adameve %>% filter(LayDate < "2020-01-01")
+
+colours <- read.delim(paste0(DATA_DIR,"/line_colours.txt"),header=F,sep="\t",stringsAsFactors=F)
+```
+
+### Model directory
+
+We need to make a directory to save the output of the modelling process.
+
+```{r made_model_saving_directory}
+
+if(!dir.exists(paste0(DATA_DIR,"/brms_models"))){
+  dir.create(paste0(DATA_DIR,"/brms_models"))
+}
+
+```
+
+### Event column function
+
+This is a function which I use to generate a new column in a data.frame which indexes the time since a given event has passed, e.g. if some big event happened in May 2018, it would start at 1 at that time and increment by 1 each month after. This is a holdover from a previous version of the paper where I did lots of complicated interrupted time series analysis, and tested the effect of different intervention on phenotypic change over time, using different offsets for the delay between the event itself and the onset of its effect.
+
+```{r}
+get_event_column <- function(month,year,data,prefix,delay=0){
+  
+  tmp <- data %>%
+    filter(!is.na(LayYear),!is.na(LayMonth)) %>%
+    group_by(LayYear,LayMonth) %>%
+    select(LayYear,LayMonth) %>%
+    slice_sample(n=1) %>%
+    ungroup %>%
+    mutate(order=1:n())
+  
+  index <- which(tmp$LayYear == year & tmp$LayMonth == month) + delay
+  
+  event <- c(rep(0,index-1),rep(1,nrow(tmp)-index+1))
+  timing <- c(rep(0,index-1),seq(from=1,to=(nrow(tmp)-index+1)))
+  
+  tmp$Timing <- timing
+  tmp$Event <- event
+  
+  colnames(tmp)[4:5] <- paste0(prefix,c("_TimeSince","_Onset"))
+  
+  tmp %>% select(-order) %>% return()
+  
+}
+```
+
+## Brief description
+
+Our data is collected as a series of measurements with time stamps. We make full use of all observations, without any summarisation prior to modelling except for plotting purposes.
+
+### Measurements
+
+- **Nymph length** (mm) taken from raw data. Response distribution is **Gaussian**.
+- **Egg volume** (mm^3^) calculated as a cylinder using egg width and egg length. Response distribution is **Gaussian**.
+- **Hatch rate** calculated from the number of hatched versus unhatched eggs. Response distribution is **binomial**. We implement this using two variables, the total number of nymphs hatched and the total number of eggs, using the `success | trials(size)` syntax.
+
+For all of these, we consider only non-surplus nymphs. These represent a biased subset of the actually hatching nymphs and they have different trait distributions.
+
+### Time index column
+
+We need a variable that marks the passage of time. This is simple 1 to the index of the final month in the data were working with.
+
+```{r time_index}
+months <- data.frame(LayMonth=1:12,LayMonth_Cal=c("Jan","Feb","Mar",
+                                                  "Apr","May","Jun",
+                                                  "Jul","Aug","Sep",
+                                                  "Oct","Nov","Dec"))
+
+time <- adameve_cutoff %>%
+  filter(LayYear < 2019, LayYear > 2011) %>%
+  group_by(LayYear,LayMonth) %>%
+  slice_sample(n=1) %>%
+  select(LayYear,LayMonth) %>%
+  ungroup() %>%
+  arrange(LayYear,LayMonth) %>%
+  mutate(Time=1:n()) %>%
+  merge(months)
+```
+
+### Summarising measurements
+
+Making the data objects used in modelling
+
+```{r modelling_objects}
+
+nymph_modelling <- adameve_cutoff %>%
+  filter(IsSurplus=="N",HasInfo=="Y",!is.na(NymphLength)) %>%
+  select(LayMonth,LayYear,NymphLength,LayDate)
+
+eggv_modelling <- adameve_cutoff %>%
+  mutate(EggVolume = EggLength * (EggWidth/2)^2 * pi) %>%
+  filter(IsSurplus=="N",HasInfo=="Y",!is.na(EggVolume)) %>%
+  select(LayMonth,LayYear,EggVolume, LayDate)
+
+hatch_modelling <- adameve_cutoff %>%
+  filter(IsSurplus=="N",HasInfo=="Y") %>%
+  group_by(LayDate) %>%
+  summarise(TotalEggs = n(),
+            TotalNymphs=sum(!is.na(NymphLength)),
+            LayMonth=first(LayMonth),
+            LayYear=first(LayYear))
+
+```
+
+### Priors
+
+```{r priors}
+
+intercept_slope_prior_nymph <- c(prior(normal(20,5), class = Intercept),
+                                 prior(normal(0, 1), class = b),
+                                 prior(exponential(0.05),class=sd))
+
+intercept_slope_prior_eggv <- c(prior(normal(50,10), class = Intercept),
+                                prior(normal(0, 1), class = b),
+                                prior(exponential(0.05),class=sd))
+
+intercept_slope_prior_eggw <- c(prior(normal(10,10), class = Intercept),
+                                prior(normal(0, 1), class = b),
+                                prior(exponential(0.05),class=sd))
+
+intercept_slope_prior_hatch <- c(prior(normal(10,5), class = Intercept),
+                                 prior(normal(0, 1), class = b),
+                                 prior(exponential(0.05),class=sd))
+```
+
+### Temperature data
+
+We do not use the temperature data but here we plot the RH data for a supplementary figure.
+
+
+```{r plotting_RH_data}
+
+p_rh <- temperature %>% filter(Glasshouse %in% c("5","6","7")) %>%
+  mutate(Glasshouse = recode(Glasshouse, "5" = "GH5", "6" = "GH6", "7" = "GH7")) %>%
+  ggplot(aes(x=Date,y=RH, colour=Glasshouse)) + 
+  geom_point(alpha=0.1,size=1) + 
+  facet_wrap(~fct_rev(Glasshouse),
+             ncol=1,
+             strip.position = "right") + 
+  scale_y_continuous(limits=c(0,100)) + 
+  scale_colour_brewer(palette = "YlOrRd") + 
+  theme_bw() + 
+  theme(axis.ticks=element_blank(),
+        panel.grid=element_blank(),
+        legend.position="none",
+        axis.title.y=element_text(angle=0,vjust=0.5,size=6),
+        axis.text=element_text(size=5),
+        axis.title.x=element_blank()) + 
+  labs(y="RH (%)") + 
+  scale_x_date(breaks=as.Date(c("2008-01-01","2010-01-01",
+                        "2012-01-01","2014-01-01",
+                        "2016-01-01","2018-01-01",
+                        "2020-01-01")),
+               labels=c("2008","2010","2012","2014","2016","2018","2020"),
+               limits=as.Date(c("2008-01-01","2020-01-01")))
+
+png(paste0(FIGURE_DIR,"/rh_fig.png"),res=300,width=4,height=3,units='in')
+plot(p_rh)
+dev.off()
+```
+
+## Modelling overall change {.tabset}
+
+In this tab, we model the overall amount of change for each variable of interest in both the AdamEve Line. We compare the years 2009 and 2020. Data from 2008 and 2021 are incomplete, and so we cannot use them to reliably estimate seasonal effects.
+
+### Nymph length
+
+```{r nymph_length_change_model}
+
+adameve_change_n <- adameve %>%
+  filter(LayYear %in% c(2009,2020),!is.na(NymphLength),IsSurplus=="N",HasInfo=="Y") %>%
+  select(LayYear,LayMonth,NymphLength) %>%
+  mutate(Change = ifelse(LayYear==2009,0,1)) %>%
+  merge(months)
+
+change_n_prior <- c(prior(normal(20,3), class = Intercept),
+                    prior(normal(0, 10), class = b),
+                    prior(exponential(0.05),class=sd))
+
+if(file.exists(paste0(DATA_DIR,"/brms_models/adameve_change_n_model.RData"))){
+  load(paste0(DATA_DIR,"/brms_models/adameve_change_n_model.RData"))
+} else {
+adameve_change_n_model <- brm(NymphLength ~ 1 + 
+                                (1|LayMonth_Cal) + 
+                                Change,
+                              data=adameve_change_n,
+                              seed=23569245,
+                              family=gaussian(),
+                              chains=4,cores=2,
+                              sample_prior='yes',
+                              warmup=1000,
+                              prior=change_n_prior,
+                              silent=2,
+                              refresh=0)
+
+save(adameve_change_n_model,
+     file=paste0(DATA_DIR,"/brms_models/adameve_change_n_model.RData"))
+
+}
+
+summary(adameve_change_n_model)
+plot(adameve_change_n_model)
+
+```
+
+### Egg volume
+
+```{r egg_volume_change_model}
+
+adameve_change_ev <- adameve %>%
+  mutate(EggVolume = EggLength * (EggWidth/2)^2 * pi) %>%
+  filter(LayYear %in% c(2009,2020),!is.na(EggVolume),IsSurplus=="N",HasInfo=="Y") %>%
+  select(LayYear,LayMonth,EggVolume) %>%
+  mutate(Change = ifelse(LayYear==2009,0,1)) %>%
+  merge(months)
+
+change_ev_prior <- c(prior(normal(50,10), class = Intercept),
+                    prior(normal(0, 10), class = b),
+                    prior(exponential(0.05),class=sd))
+
+if(file.exists(paste0(DATA_DIR,"/brms_models/adameve_change_ev_model.RData"))){
+  load(paste0(DATA_DIR,"/brms_models/adameve_change_ev_model.RData"))
+} else {
+adameve_change_ev_model <- brm(EggVolume ~ 1 + 
+                                (1|LayMonth_Cal) + 
+                                Change,
+                              data=adameve_change_ev,
+                              seed=23569245,
+                              family=gaussian(),
+                              chains=4,cores=2,
+                              sample_prior='yes',
+                              warmup=1000,
+                              prior=change_ev_prior,
+                              silent=2,
+                              refresh=0)
+
+save(adameve_change_ev_model,
+     file=paste0(DATA_DIR,"/brms_models/adameve_change_ev_model.RData"))
+
+}
+
+summary(adameve_change_ev_model)
+plot(adameve_change_ev_model)
+
+```
+
+### Hatch rate
+
+```{r hatch_rate_change_model}
+
+adameve_change_h <- adameve %>%
+  filter(LayYear %in% c(2009,2020),IsSurplus=="N",HasInfo=="Y") %>%
+  group_by(LayDate) %>%
+  summarise(TotalEggs = n(),
+            TotalNymphs=sum(!is.na(NymphLength)),
+            LayMonth=first(LayMonth),
+            LayYear=first(LayYear)) %>%
+  select(LayYear,LayMonth,TotalEggs,TotalNymphs) %>%
+  mutate(Change = ifelse(LayYear==2009,0,1)) %>%
+  merge(months)
+
+change_h_prior <- c(prior(normal(20,3), class = Intercept),
+                    prior(normal(0, 10), class = b),
+                    prior(exponential(0.05),class=sd))
+
+if(file.exists(paste0(DATA_DIR,"/brms_models/adameve_change_h_model.RData"))){
+  load(paste0(DATA_DIR,"/brms_models/adameve_change_h_model.RData"))
+} else {
+adameve_change_h_model <- brm(TotalNymphs | trials(TotalEggs) ~ 1 + 
+                                (1|LayMonth_Cal) + 
+                                Change,
+                              data=adameve_change_h,
+                              seed=23569245,
+                              family=binomial(),
+                              chains=4,cores=2,
+                              sample_prior='yes',
+                              warmup=1000,
+                              prior=change_h_prior,
+                              silent=2,
+                              refresh=0)
+
+save(adameve_change_h_model,
+     file=paste0(DATA_DIR,"/brms_models/adameve_change_h_model.RData"))
+
+}
+
+summary(adameve_change_h_model)
+plot(adameve_change_h_model)
+
+```
+
+### Summarising
+
+Let's combine these into a single figure. We will center and scale coefficient estimates for the Change parameter using the variable's mean and standard deviation. For the binomial model, we will simply present it as is.
+
+```{r plotting_change}
+
+colour=colours[colours$V1=="AdamEve",2]
+
+sd_n = sd(adameve_change_n$NymphLength,na.rm=T)
+tmp1 <- adameve_change_n_model %>%
+  spread_draws(b_Change) %>%
+  mutate(b_Change_Scaled = (b_Change)/sd_n,
+         Var="NymphLength") %>%
+  select(Var,b_Change_Scaled)
+
+sd_ev = sd(adameve_change_ev$EggVolume,na.rm=T)
+tmp2 <- adameve_change_ev_model %>%
+  spread_draws(b_Change) %>%
+  mutate(b_Change_Scaled = (b_Change)/sd_ev,
+         Var="EggVolume") %>%
+  select(Var,b_Change_Scaled)
+
+p_cont_change <- rbind(tmp1,
+      tmp2) %>%
+  ggplot(aes(y=Var,x=b_Change_Scaled)) + 
+  stat_pointinterval(.width = c(0.5,0.8,0.95),fill=colour,point_size=3,pch=21) + 
+  theme_bw() + 
+  theme(axis.ticks=element_blank(),
+        panel.grid=element_blank(),
+        axis.title.x=element_text(size=7),
+        axis.text.x=element_text(size=6),
+        axis.text.y=element_text(size=6)) + 
+  geom_vline(xintercept=0,linetype="dashed") + 
+  labs(y="",
+       x="Scaled mean change from 2009 - 2020") + 
+  scale_x_continuous(limits=c(-0.62,0.02),breaks=c(-0.6,-0.4,-0.2,-0)) + 
+  scale_y_discrete(labels=c("Nymph\nlength","Egg\nvolume"))
+
+inv_logit <- function(x){return(exp(x)/(1+exp(x)))}
+
+tmp <- adameve_change_h_model %>%
+  spread_draws(b_Change,b_Intercept) %>%
+  mutate(pred_2009=inv_logit(b_Intercept),
+         pred_2020=inv_logit(b_Intercept+b_Change)) %>%
+  select(pred_2009,
+         pred_2020) %>% mutate(Diff=pred_2020-pred_2009)
+
+p_hatch_change <- ggplot(tmp,aes(x=Diff)) + 
+  stat_pointinterval(.width = c(0.5,0.8,0.95),fill=colour,point_size=3,pch=21) + 
+  theme_bw() + 
+  theme(axis.ticks=element_blank(),
+        panel.grid=element_blank(),
+        axis.title.x=element_text(size=7),
+        axis.text.x=element_text(size=6),
+        axis.text.y=element_blank(),
+        axis.title.y=element_blank()) + 
+  geom_vline(xintercept=0,linetype="dashed") + 
+  labs(x="Change in hatch rate from 2009 - 2020") + 
+  scale_x_continuous(limits=c(-0.62,0.02),breaks=c(-0.6,-0.4,-0.2,-0))
+
+p_comb <- p_hatch_change / p_cont_change + plot_layout(heights=c(1,2.5))
+
+png(paste0(FIGURE_DIR,"/change_figure.png"),res=300,width=3,height=2.5,units='in')
+plot(p_comb)
+dev.off()
+
+```
+
+### Clearing space
+
+```{r clearing_change_models}
+
+rm(adameve_change_n_model,
+     adameve_change_ev_model,
+     adameve_change_ew_model,
+     adameve_change_h_model
+     )
+
+```
+
+## Modelling variable dependencies {.tabset}
+
+We are making some assumptions about the validity of these variables as fitness proxies. Here, we test this explicitly using the numbered eggs from the AdamEve line. These go from the beginning of the line to February 2019.
+
+### Modelling
+
+First, we test whether the sizes of hatched and unhatched eggs differ. This will tell us whether larger eggs are in fact a good thing.
+
+```{r fitness_models_egg_hatch_size}
+
+egg_fitness <- adameve %>% 
+  filter(LayDate < '2019-02-01',IsSurplus=="N",HasInfo=="Y") %>%
+  mutate(EggVolume = EggLength * (EggWidth/2)^2 * pi,
+         Hatched = ifelse(is.na(HatchDate),0,1)) %>%
+  select(LayYear,LayMonth,EggVolume,Hatched) %>%
+  merge(months)
+
+intercept_slope_prior_eggv <- c(prior(normal(50,10), class = Intercept),
+                                prior(normal(0, 20), class = b),
+                                prior(exponential(0.05),class=sd))
+
+if(file.exists(paste0(DATA_DIR,"/brms_models/fitness_ev_hatch_model.RData"))){
+  load(paste0(DATA_DIR,"/brms_models/fitness_ev_hatch_model.RData"))
+} else {
+  
+  model_eggv_v_hatched <- brm(EggVolume ~ 1 + 
+                                (1|LayMonth_Cal) + 
+                                (1|LayYear) + 
+                                Hatched,
+                              data=egg_fitness,
+                              seed=23569245,
+                              family=gaussian(),
+                              chains=4,cores=2,
+                              sample_prior='yes',
+                              warmup=1000,
+                              prior=intercept_slope_prior_eggv,
+                              silent=2,
+                              refresh=0)
+ 
+  save(model_eggv_v_hatched,
+       file=paste0(DATA_DIR,"/brms_models/fitness_ev_hatch_model.RData"))
+   
+}
+  
+summary(model_eggv_v_hatched)
+plot(model_eggv_v_hatched)
+
+```
+
+So slightly larger eggs, in terms of both volume and width, definitely hatch at a higher rate. Sigmas do not sample fantastically well but the Rhat is pretty good and the parameter sample size is decent.
+
+Next, we test whether either of these two variables significantly predict nymph length. If egg size is a proxy for fitness, and nymph length is correlated with egg size, then nymph length can also act as a fitness proxy.
+
+```{r fitness_models_egg_nymph_size}
+
+nymph_fitness <- adameve %>% 
+  filter(LayDate < '2019-02-01',IsSurplus=="N",HasInfo=="Y",!is.na(NymphLength)) %>%
+  mutate(EggVolume = EggLength * (EggWidth/2)^2 * pi) %>%
+  select(LayYear,LayMonth,EggVolume,EggWeight,NymphLength) %>%
+  merge(months)
+
+intercept_slope_prior_nymph <- c(prior(normal(20,5), class = Intercept),
+                                 prior(normal(0, 1), class = b),
+                                 prior(exponential(0.05),class=sd))
+
+if(file.exists(paste0(DATA_DIR,"/brms_models/fitness_ev_nymph_model.RData"))){
+  load(paste0(DATA_DIR,"/brms_models/fitness_ev_nymph_model.RData"))
+} else {
+  
+  model_eggv_v_nymph <- brm(NymphLength ~ 1 + 
+                              (1|LayMonth_Cal) + 
+                              (1|LayYear) + 
+                              EggVolume,
+                            data=nymph_fitness,
+                            seed=23569245,
+                            family=gaussian(),
+                            chains=4,cores=2,
+                            sample_prior='yes',
+                            warmup=1000,
+                            prior=intercept_slope_prior_nymph,
+                            silent=2,
+                            refresh=0)
+ 
+  save(model_eggv_v_nymph,
+       file=paste0(DATA_DIR,"/brms_models/fitness_ev_nymph_model.RData"))
+   
+}
+  
+summary(model_eggv_v_nymph)
+plot(model_eggv_v_nymph)
+
+```
+
+Yes, in both cases, egg size is positively correlated with nymph size. For egg volume, for some reason, this effect is tiny!
+
+### Plotting
+ 
+Now we plot them!
+
+```{r fitness_models_plotting}
+
+colour=colours[colours$V1=="AdamEve",2]
+
+### Three options here for p1
+### 1. Plotting the points with a stat_pointinterval overlay
+### 2. Plotting the points with a stat_lineribbon overlay
+### 3. Plotting the 
+
+p_egg_fitness <- egg_fitness %>% select(Hatched,EggVolume,LayYear,LayMonth_Cal) %>%
+  data_grid(Hatched=sample(c(0,1),100,replace=T),
+            LayMonth_Cal=sample(unique(nymph_fitness$LayMonth_Cal),100,replace=T),
+            LayYear=sample(unique(nymph_fitness$LayYear),100,replace=T)) %>%
+  add_epred_draws(model_eggv_v_hatched, ndraws = 100) %>%
+  ggplot() + 
+  geom_jitter(data=egg_fitness,aes(y=as.factor(Hatched),x=EggVolume),colour="darkgrey",
+              height=0.3,width=0) +
+#  stat_lineribbon(aes(x=as.factor(Hatched),y=.epred),
+#                .width = c(.99,0.95,0.8), color = colour,fill=colour,alpha=0.2,
+#                size=2) + 
+#  stat_halfeye(data=egg_fitness,
+#               mapping=(aes(x=as.factor(Hatched),y=EggVolume)),
+#               .width = c(.99,0.95,0.8),
+#               pch=21,fill="darkgrey") +
+  stat_pointinterval(aes(y=as.factor(Hatched),x=.epred),.width = c(0.5,0.8,0.95),
+                     fill=colour,point_size=3,pch=21) + 
+  theme_bw() + 
+  theme(axis.ticks=element_blank(),
+        panel.grid=element_blank(),
+        axis.title.x=element_blank(),
+        axis.text.x=element_blank()) + 
+  scale_x_continuous(limits=c(50,127)) + 
+  scale_y_discrete(breaks=c(0,1),
+                   labels=c("Unhatched","Hatched")) + 
+  labs(x="",
+       y="")
+
+p_egg_nymph <- nymph_fitness %>%
+  data_grid(EggVolume=seq_range(EggVolume,n=100),
+            LayMonth_Cal=sample(unique(nymph_fitness$LayMonth_Cal),100,replace=T),
+            LayYear=sample(unique(nymph_fitness$LayYear),100,replace=T)) %>%
+  add_epred_draws(model_eggv_v_nymph, ndraws = 100) %>%
+  ggplot() +
+  geom_point(data=nymph_fitness,aes(x=EggVolume,y=NymphLength),colour="darkgrey") + 
+  stat_lineribbon(aes(x=EggVolume,y=.epred),
+                  .width = c(.95,0.8,0.5), color = colour,fill=colour,alpha=0.2,
+                  size=2) + 
+  theme_bw() + 
+  theme(axis.ticks=element_blank(),
+        panel.grid=element_blank(),
+        axis.title.y=element_text(angle=0,vjust=0.5,hjust=1)) + 
+  scale_x_continuous(limits=c(50,127)) + 
+  labs(x="Egg volume",
+       y="Nymph\nlength")
+
+p_comb <- p_egg_fitness / p_egg_nymph + 
+  plot_layout(heights=c(1,3))
+
+png(paste0(FIGURE_DIR,"/fitness_figure.png"),res=300,width=6,height=6,units='in')
+plot(p_comb)
+dev.off()
+
+```
+
+### Clearing space
+ 
+Finally, we save these models for later.
+
+```{r fitness_models_clearing}
+
+rm(model_eggv_v_hatched,
+   model_eggv_v_nymph,
+   model_eggv_v_inc,
+   model_nymph_v_inc)
+
+```
+
+## Modelling gene flow {.tabset}
+
+This will be a set of models starting from 2016 and going to 2020, the end of the data. This section will encompass two sets of models. First, we estimate the rate of increase in hatch rate, nymph length, and egg volume in the LHIP line. Then, we model the effect of the introduction of new material into the ADAMEVE line, using different onset periods.
+
+### LHIP models {.tabset}
+
+#### Nymph length
+
+```{r lhip_nymph_model}
+
+nymph_modelling <- lhip %>%
+  filter(IsSurplus=="N",HasInfo=="Y",!is.na(NymphLength)) %>%
+  select(LayMonth,LayYear,NymphLength)
+tmp <- nymph_modelling %>% 
+  select(LayYear,LayMonth) %>%
+  group_by(LayYear,LayMonth) %>%
+  dplyr::slice_sample(n=1) %>% ungroup %>%
+  arrange(LayYear,LayMonth) %>%
+  mutate(Time = 1:n())
+nymph_modelling <- merge(nymph_modelling,tmp) %>%
+  merge(months)
+
+if(file.exists(paste0(DATA_DIR,"/brms_models/model_lhip_nymph.RData"))){
+  load(paste0(DATA_DIR,"/brms_models/model_lhip_nymph.RData"))
+} else {
+  
+  model_lhip_nymph <- brm(NymphLength ~ 1 + 
+                            Time + (1|LayMonth_Cal),
+                          data=nymph_modelling,
+                          seed=23569245,
+                          family=gaussian(),
+                          chains=4,cores=2,
+                          sample_prior='yes',
+                          warmup=1000,
+                          prior=intercept_slope_prior_nymph,
+                          silent=2,
+                          refresh=0)
+  
+  save(model_lhip_nymph,
+       file=paste0(DATA_DIR,"/brms_models/model_lhip_nymph.RData"))
+  
+}
+
+summary(model_lhip_nymph)
+
+nymph_modelling %>% 
+  add_predicted_draws(ndraws=500,model_lhip_nymph) %>%
+  ggplot(aes(x=Time,y=NymphLength)) + 
+  stat_lineribbon(aes(y=.prediction), .width = c(.95, .8, .5), color = "#08519C") + 
+  geom_point(data=nymph_modelling,size=2,alpha=0.2) + 
+  scale_fill_brewer()
+
+```
+
+Sure but steady increase in nymph length.
+
+#### Egg volume
+
+```{r lhip_egg_volume_model}
+
+eggv_modelling <- lhip %>%
+  mutate(EggVolume = EggLength * (EggWidth/2)^2 * pi) %>%
+  filter(IsSurplus=="N",HasInfo=="Y",!is.na(EggVolume)) %>%
+  select(LayMonth,LayYear,EggVolume)
+tmp <- eggv_modelling %>% 
+  select(LayYear,LayMonth) %>%
+  group_by(LayYear,LayMonth) %>%
+  dplyr::slice_sample(n=1) %>% ungroup %>%
+  arrange(LayYear,LayMonth) %>%
+  mutate(Time = 1:n())
+eggv_modelling <- merge(eggv_modelling,tmp) %>%
+  merge(months)
+
+if(file.exists(paste0(DATA_DIR,"/brms_models/model_lhip_ev.RData"))){
+  load(paste0(DATA_DIR,"/brms_models/model_lhip_ev.RData"))
+} else {
+
+    model_lhip_ev <- brm(EggVolume ~ 1 + 
+                           Time + (1|LayMonth_Cal),
+                         data=eggv_modelling,
+                         seed=23569245,
+                         family=gaussian(),
+                         chains=4,cores=2,
+                         sample_prior='yes',
+                         warmup=1000,
+                         prior=intercept_slope_prior_eggv,
+                         silent=2,
+                         refresh=0)
+    
+  save(model_lhip_ev,
+       file=paste0(DATA_DIR,"/brms_models/model_lhip_ev.RData"))
+  
+}
+
+summary(model_lhip_ev)
+
+eggv_modelling %>% 
+  add_predicted_draws(ndraws=500,model_lhip_ev) %>%
+  ggplot(aes(x=Time,y=EggVolume)) + 
+  stat_lineribbon(aes(y=.prediction), .width = c(.95, .8, .5), color = "#08519C") + 
+  geom_point(data=eggv_modelling,size=2,alpha=0.2) + 
+  scale_fill_brewer()
+
+```
+
+Another sure but steady increase.
+
+#### Hatch rate
+
+```{r lhip_hatch_model}
+
+intercept_slope_prior_hatch <- c(prior(normal(10,5), class = Intercept),
+                                 prior(normal(0, 1), class = b),
+                                 prior(exponential(0.05),class=sd))
+
+max_laydate <- max(lhip$LayDate,na.rm=T) - (7.5*30)
+
+hatch_modelling <- lhip %>%
+  filter(IsSurplus=="N",HasInfo=="Y",LayDate < "2020-10-30") %>%
+  group_by(LayDate) %>%
+  summarise(TotalEggs = n(),
+            TotalNymphs=sum(!is.na(NymphLength)),
+            LayMonth=first(LayMonth),
+            LayYear=first(LayYear))
+tmp <- hatch_modelling %>% 
+  select(LayYear,LayMonth) %>%
+  group_by(LayYear,LayMonth) %>%
+  dplyr::slice_sample(n=1) %>% ungroup %>%
+  arrange(LayYear,LayMonth) %>%
+  mutate(Time = 1:n())
+hatch_modelling <- merge(hatch_modelling,tmp) %>%
+  merge(months)
+
+if(file.exists(paste0(DATA_DIR,"/brms_models/model_lhip_hatch.RData"))){
+  load(paste0(DATA_DIR,"/brms_models/model_lhip_hatch.RData"))
+} else {
+  
+  model_lhip_hatch <- brm(TotalNymphs | trials(TotalEggs) ~ 1 + 
+                            Time + (1|LayMonth_Cal),
+                          data=hatch_modelling,
+                          seed=23569245,
+                          family=binomial(),
+                          chains=4,cores=2,
+                          sample_prior='yes',
+                          warmup=1000,
+                          prior=intercept_slope_prior_hatch,
+                          silent=2,
+                          refresh=0)
+  
+        save(model_lhip_hatch,
+       file=paste0(DATA_DIR,"/brms_models/model_lhip_hatch.RData"))
+  
+
+}
+
+summary(model_lhip_hatch)
+
+hatch_modelling %>% 
+  add_predicted_draws(ndraws=500,model_lhip_hatch) %>%
+  ggplot(aes(x=Time,y=TotalNymphs/TotalEggs)) + 
+  stat_lineribbon(aes(y=.prediction/TotalEggs), .width = c(.95, .8, .5), color = "#08519C") + 
+  geom_point(data=hatch_modelling,alpha=0.2,aes(size=TotalEggs)) + 
+  scale_fill_brewer()
+
+```
+
+Here, we do a pretty poor job of modelling the change in hatch rate, mostly because it plateaus. What if we just did away with monthly effects?
+
+```{r lhip_hatch_model_no_month}
+
+intercept_slope_prior_hatch <- c(prior(normal(10,5), class = Intercept),
+                                 prior(normal(0, 1), class = b))
+
+if(file.exists(paste0(DATA_DIR,"/brms_models/model_lhip_hatch_no_month.RData"))){
+  load(paste0(DATA_DIR,"/brms_models/model_lhip_hatch_no_month.RData"))
+} else {
+  
+  model_lhip_hatch_no_month <- brm(TotalNymphs | trials(TotalEggs) ~ 1 + 
+                                     Time,
+                                   data=hatch_modelling,
+                                   seed=23569245,
+                                   family=binomial(),
+                                   chains=4,cores=2,
+                                   sample_prior='yes',
+                                   warmup=1000,
+                                   prior=intercept_slope_prior_hatch,
+                                   silent=2,
+                                   refresh=0)
+  
+        save(model_lhip_hatch_no_month,
+       file=paste0(DATA_DIR,"/brms_models/model_lhip_hatch_no_month.RData"))
+
+}
+
+summary(model_lhip_hatch_no_month)
+
+hatch_modelling %>% 
+  add_predicted_draws(ndraws=500,model_lhip_hatch_no_month) %>%
+  ggplot(aes(x=Time,y=TotalNymphs/TotalEggs)) + 
+  stat_lineribbon(aes(y=.prediction/TotalEggs), .width = c(.95, .8, .5), color = "#08519C") + 
+  geom_point(data=hatch_modelling,alpha=0.2,aes(size=TotalEggs)) + 
+  scale_fill_brewer()
+
+```
+
+This is possibly even worse. We will attempt go model this with a piecewise regression with a random change point.
+
+```{r lhip_hatch_model_changepoint}
+
+# Code stolen from:
+# https://discourse.mc-stan.org/t/piecewise-linear-mixed-models-with-a-random-change-point/5306/9
+
+if(file.exists(paste0(DATA_DIR,"/brms_models/model_lhip_hatch_changepoint.RData"))){
+  load(paste0(DATA_DIR,"/brms_models/model_lhip_hatch_changepoint.RData"))
+} else {
+  
+  # The model
+  bform3 <- bf(
+    TotalNymphs | trials(TotalEggs) ~ Intercept + #(1|LayMonth_Cal) +
+      slope1 * Time * (inv_logit(change - Time)*5) +  # Section 1
+      (slope1 * change + slope2 * (Time - change)) * (inv_logit(change - Time)*5),  # Section 2
+    slope1 + slope2 + change ~ 1,  # Fixed slopes and changepoint
+    Intercept ~ 1 + (1|LayMonth_Cal),  # varying intercepts for each month
+    #change ~ 1,
+    nl = TRUE
+  )
+  
+  # Priors
+  bprior3 <- prior(normal(0, 5), nlpar = "Intercept") +
+    prior(normal(0, 2), nlpar = "slope1") +
+    prior(normal(0, 2), nlpar = "slope2") +
+    prior(uniform(0, 10), nlpar = "change")
+  
+  # Fit it!
+  model_lhip_hatch_changepoint <- brm(bform3, 
+                                      data = hatch_modelling, 
+                                      seed=23569245,
+                                      prior = bprior3, 
+                                      chains=4,cores=2,
+                                      #init = inits3,
+                                      family = binomial(),
+                                      warmup=1000,
+                                      silent=2,
+                                      refresh=0)
+
+            save(model_lhip_hatch_changepoint,
+       file=paste0(DATA_DIR,"/brms_models/model_lhip_hatch_changepoint.RData"))
+
+}
+
+summary(model_lhip_hatch_changepoint)
+
+hatch_modelling %>% 
+  add_predicted_draws(ndraws=500,model_lhip_hatch_changepoint) %>%
+  ggplot(aes(x=Time,y=TotalNymphs/TotalEggs)) + 
+  stat_lineribbon(aes(y=.prediction/TotalEggs), .width = c(.95, .8, .5), color = "#08519C") + 
+  geom_point(data=hatch_modelling,alpha=0.2,aes(size=TotalEggs)) + 
+  scale_fill_brewer()
+
+
+```
+
+This looks like it makes way more sense. Let's compare all three models.
+
+```{r lhip_hatch_model_comparison}
+
+print("Plotting basic model with months")
+plot(model_lhip_hatch)
+
+print("=====================================================")
+print("=====================================================")
+
+print("Plotting basic model with no months")
+plot(model_lhip_hatch_no_month)
+
+print("=====================================================")
+print("=====================================================")
+
+print("Plotting changepoint model")
+plot(model_lhip_hatch_changepoint)
+
+print("=====================================================")
+print("=====================================================")
+
+print("Comparing model fits with LOO")
+loo_compare(loo(model_lhip_hatch),
+            loo(model_lhip_hatch_no_month),
+            loo(model_lhip_hatch_changepoint))
+
+print("=====================================================")
+print("=====================================================")
+
+print("Comparing model weights with LOO")
+model_weights(model_lhip_hatch,
+              model_lhip_hatch_no_month,
+              model_lhip_hatch_changepoint) * 100
+
+print("=====================================================")
+print("=====================================================")
+
+print("Comparing model weights with WAIC")
+model_weights(model_lhip_hatch,
+              model_lhip_hatch_no_month,
+              model_lhip_hatch_changepoint,
+              weights = "waic") * 100
+
+
+
+```
+
+Absolute no competition. The changepoint model is the best formulation here. And, it indicates that after a few months of increasing hatch rate, the trend is gradual decline but this slope is very small.
+
+#### Save and then clear LHIP models
+
+```{r clear_lhip_models, eval=F}
+
+rm(model_lhip_nymph,
+   model_lhip_ev,
+   model_lhip_hatch,
+   model_lhip_hatch_no_month,
+   model_lhip_hatch_changepoint)
+
+```
+
+### ADAMEVE models {.tabset}
+
+In this section, we use an interrupted time-series approach to estimate the effect of the introduction of Vanessa's material to the ADAMEVE line.  We will use the start date of the LHIP line as the onset of this intervention. We're not really interested in (nor do we have the data for) testing different hypothesis about the timing of this effect, just that there might be one, so we only do the null model against a 0 month delay model where Vanessa's influence is immediate.
+
+#### Setup
+
+Lots of things to set up here
+
+```{r adameve_rescue_setup}
+
+# Get start date of intervention and extract month and year variables
+
+start_date <- min(lhip$LayDate,na.rm=T)
+
+# Subset data to just the time period of interest
+# Also add egg volume
+
+adameve_rescue <- adameve %>% filter(LayDate > (start_date - (365*2)),
+                                     LayDate < (start_date + (365*2)),
+                                     IsSurplus=="N",HasInfo=="Y") %>%
+  mutate(EggVolume = EggLength * (EggWidth/2)^2 * pi)
+
+# Make event index variables for 0 months delay
+
+rescue0 <- get_event_column(9,2019,adameve_rescue,"Rescue",0)
+colnames(rescue0)[3:4] <- paste0(colnames(rescue0)[3:4],"_0")
+
+# Make time index variables
+
+months <- data.frame(LayMonth=1:12,LayMonth_Cal=c("Jan","Feb","Mar",
+                                                  "Apr","May","Jun",
+                                                  "Jul","Aug","Sep",
+                                                  "Oct","Nov","Dec"))
+
+time <- adameve_rescue %>%
+  group_by(LayYear,LayMonth) %>%
+  slice_sample(n=1) %>%
+  select(LayYear,LayMonth) %>%
+  ungroup() %>%
+  arrange(LayYear,LayMonth) %>%
+  mutate(Time=1:n()) %>%
+  merge(months)
+
+# Make priors, exactly the same as for infection models
+
+intercept_slope_prior_nymph <- c(prior(normal(20,5), class = Intercept),
+                                 prior(normal(0, 1), class = b),
+                                 prior(exponential(0.05),class=sd))
+
+intercept_slope_prior_eggv <- c(prior(normal(50,10), class = Intercept),
+                                prior(normal(0, 1), class = b),
+                                prior(exponential(0.05),class=sd))
+
+intercept_slope_prior_hatch <- c(prior(normal(10,5), class = Intercept),
+                                 prior(normal(0, 1), class = b),
+                                 prior(exponential(0.05),class=sd))
+
+intercept_slope_prior_inc <- c(prior(normal(200,50), class = Intercept),
+                               prior(normal(0, 5), class = b),
+                               prior(exponential(0.05),class = sd),
+                               prior(normal(0,2),class = alpha))
+
+```
+
+#### Nymph length {.tabset}
+
+##### Model
+
+```{r adameve_rescue_model_nymph}
+
+tmp_modelling <- merge(rescue0,time) %>%
+  merge(adameve_rescue) %>%
+  filter(!is.na(NymphLength)) %>%
+  select(NymphLength,LayMonth_Cal,Time,Rescue_TimeSince_0)
+
+if(file.exists(paste0(DATA_DIR,"/brms_models/model_adameve_rescue_nymph_null.RData"))){
+  load(paste0(DATA_DIR,"/brms_models/model_adameve_rescue_nymph_null.RData"))
+} else {
+  
+  model_adameve_rescue_nymph_null <- brm(NymphLength ~ 1 + 
+                                Time + (1|LayMonth_Cal),
+                              data=tmp_modelling,
+                              seed=23569245,
+                              family=gaussian(),
+                              chains=4,cores=2,
+                              sample_prior='yes',
+                              warmup=1000,
+                              prior=intercept_slope_prior_nymph,
+                              silent=2,
+                              refresh=0)
+  
+  save(model_adameve_rescue_nymph_null,
+       file=paste0(DATA_DIR,"/brms_models/model_adameve_rescue_nymph_null.RData"))
+  
+}
+
+if(file.exists(paste0(DATA_DIR,"/brms_models/model_adameve_rescue_nymph_event0.RData"))){
+  load(paste0(DATA_DIR,"/brms_models/model_adameve_rescue_nymph_event0.RData"))
+} else {
+
+
+  model_adameve_rescue_nymph_event0 <- brm(NymphLength ~ 1 + 
+                                       Time + (1|LayMonth_Cal) +
+                                       Rescue_TimeSince_0,
+                                     data=tmp_modelling,
+                                     seed=23569245,
+                                     family=gaussian(),
+                                     chains=4,cores=2,
+                                     sample_prior='yes',
+                                     warmup=1000,
+                                     prior=intercept_slope_prior_nymph,
+                                     silent=2,
+                                     refresh=0)
+
+    save(model_adameve_rescue_nymph_event0,
+       file=paste0(DATA_DIR,"/brms_models/model_adameve_rescue_nymph_event0.RData"))
+  
+}
+
+
+print("Plotting no event model")
+summary(model_adameve_rescue_nymph_null)
+plot(model_adameve_rescue_nymph_null)
+
+print("=====================================================")
+print("=====================================================")
+
+print("Plotting 0 delay model")
+summary(model_adameve_rescue_nymph_event0)
+plot(model_adameve_rescue_nymph_event0)
+
+print("=====================================================")
+print("=====================================================")
+
+
+print("Comparing model fits with LOO")
+loo_compare(loo(model_adameve_rescue_nymph_null),
+            loo(model_adameve_rescue_nymph_event0))
+
+print("=====================================================")
+print("=====================================================")
+
+print("Comparing model weights with LOO")
+model_weights(model_adameve_rescue_nymph_null,
+              model_adameve_rescue_nymph_event0) * 100
+
+print("=====================================================")
+print("=====================================================")
+
+print("Comparing model weights with WAIC")
+model_weights(model_adameve_rescue_nymph_null,
+              model_adameve_rescue_nymph_event0,
+              weights = "waic") * 100
+
+```
+
+The evidence here is in favour of a model with no effect of Vanessa's genetic material.
+
+##### Predictions
+
+```{r adameve_rescue_model_nymph_predictions}
+
+tmp_modelling %>% 
+  add_predicted_draws(ndraws=500,model_adameve_rescue_nymph_null) %>%
+  ggplot(aes(x=Time,y=NymphLength)) + 
+  stat_lineribbon(aes(y=.prediction), .width = c(.95, .8, .5), color = "#08519C") + 
+  geom_point(data=tmp_modelling,size=2,alpha=0.2) + 
+  scale_fill_brewer() + 
+  labs(title="No event")
+
+tmp_modelling %>% 
+  add_predicted_draws(ndraws=500,model_adameve_rescue_nymph_event0) %>%
+  ggplot(aes(x=Time,y=NymphLength)) + 
+  stat_lineribbon(aes(y=.prediction), .width = c(.95, .8, .5), color = "#08519C") + 
+  geom_point(data=tmp_modelling,size=2,alpha=0.2) + 
+  scale_fill_brewer() + 
+  labs(title="Event, 0 month delay")
+
+```
+
+Concomitantly, the two model predictions barely look difference
+
+##### Clearing space
+
+```{r adameve_rescue_model_nymph_clearing}
+
+rm(model_adameve_rescue_nymph_null,
+   model_adameve_rescue_nymph_event0)
+
+```
+
+#### Egg volume{.tabset}
+
+##### Model
+
+```{r adameve_rescue_model_egg_volume}
+
+tmp_modelling <- merge(rescue0,time) %>%
+  merge(adameve_rescue) %>%
+  filter(!is.na(EggVolume)) %>%
+  select(EggVolume,LayMonth_Cal,Time,Rescue_TimeSince_0)
+
+if(file.exists(paste0(DATA_DIR,"/brms_models/model_adameve_rescue_ev_null.RData"))){
+  load(paste0(DATA_DIR,"/brms_models/model_adameve_rescue_ev_null.RData"))
+} else {
+  
+  model_adameve_rescue_ev_null <- brm(EggVolume ~ 1 + 
+                                Time + (1|LayMonth_Cal),
+                              data=tmp_modelling,
+                              seed=23569245,
+                              family=gaussian(),
+                              chains=4,cores=2,
+                              sample_prior='yes',
+                              warmup=1000,
+                              prior=intercept_slope_prior_eggv,
+                              silent=2,
+                              refresh=0)
+  
+  save(model_adameve_rescue_ev_null,
+       file=paste0(DATA_DIR,"/brms_models/model_adameve_rescue_ev_null.RData"))
+  
+}
+  
+if(file.exists(paste0(DATA_DIR,"/brms_models/model_adameve_rescue_ev_event0.RData"))){
+  load(paste0(DATA_DIR,"/brms_models/model_adameve_rescue_ev_event0.RData"))
+} else {
+
+  model_adameve_rescue_ev_event0 <- brm(EggVolume ~ 1 + 
+                                       Time + (1|LayMonth_Cal) +
+                                       Rescue_TimeSince_0,
+                                     data=tmp_modelling,
+                                     seed=23569245,
+                                     family=gaussian(),
+                                     chains=4,cores=2,
+                                     sample_prior='yes',
+                                     warmup=1000,
+                                     prior=intercept_slope_prior_eggv,
+                                     silent=2,
+                                     refresh=0)
+  
+    save(model_adameve_rescue_ev_event0,
+       file=paste0(DATA_DIR,"/brms_models/model_adameve_rescue_ev_event0.RData"))
+  
+}
+
+print("Plotting no event model")
+summary(model_adameve_rescue_ev_null)
+plot(model_adameve_rescue_ev_null)
+
+print("=====================================================")
+print("=====================================================")
+
+print("Plotting 0 delay model")
+summary(model_adameve_rescue_ev_event0)
+plot(model_adameve_rescue_ev_event0)
+
+print("=====================================================")
+print("=====================================================")
+
+print("Comparing model fits with LOO")
+loo_compare(loo(model_adameve_rescue_ev_null),
+            loo(model_adameve_rescue_ev_event0))
+
+print("=====================================================")
+print("=====================================================")
+
+print("Comparing model weights with LOO")
+model_weights(model_adameve_rescue_ev_null,
+              model_adameve_rescue_ev_event0) * 100
+
+print("=====================================================")
+print("=====================================================")
+
+print("Comparing model weights with WAIC")
+model_weights(model_adameve_rescue_ev_null,
+              model_adameve_rescue_ev_event0,
+              weights = "waic") * 100
+
+```
+
+Similar lack of evidence for an effect of Vanessa here.
+
+##### Predictions
+
+```{r adameve_rescue_model_egg_volume_predictions}
+
+tmp_modelling %>% 
+  select(-Rescue_TimeSince_0) %>%
+  add_predicted_draws(ndraws=500,model_adameve_rescue_ev_null) %>%
+  ggplot(aes(x=Time,y=EggVolume)) + 
+  stat_lineribbon(aes(y=.prediction), .width = c(.95, .8, .5), color = "#08519C") + 
+  geom_point(data=tmp_modelling,size=2,alpha=0.2) + 
+  scale_fill_brewer() + 
+  labs(title="No event")
+
+tmp_modelling %>% 
+  add_predicted_draws(ndraws=500,model_adameve_rescue_ev_event0) %>%
+  ggplot(aes(x=Time,y=EggVolume)) + 
+  stat_lineribbon(aes(y=.prediction), .width = c(.95, .8, .5), color = "#08519C") + 
+  geom_point(data=tmp_modelling,size=2,alpha=0.2) + 
+  scale_fill_brewer() + 
+  labs(title="Event, 0 month delay")
+
+```
+
+Same as before: model predictions look the same.
+
+##### Clearing space
+
+```{r adameve_rescue_model_ev_clearing}
+
+rm(model_adameve_rescue_ev_null,
+   model_adameve_rescue_ev_event0)
+
+```
+
+#### Hatch rate {.tabset}
+
+For hatch rate, we actually cut off a few months since the later records count eggs that had not yet had enough time to hatch.
+
+##### Model
+
+```{r adameve_rescue_model_hatch, echo=F}
+
+tmp_modelling <- adameve_rescue %>%
+  filter(IsSurplus=="N",HasInfo=="Y") %>%
+  group_by(LayDate) %>%
+  summarise(TotalEggs = n(),
+            TotalNymphs=sum(!is.na(NymphLength)),
+            LayMonth=first(LayMonth),
+            LayYear=first(LayYear)) %>%
+  merge(rescue0) %>%
+  merge(time) %>%
+  filter(Time < 46)
+
+if(file.exists(paste0(DATA_DIR,"/brms_models/model_adameve_rescue_hatch_null.RData"))){
+  load(paste0(DATA_DIR,"/brms_models/model_adameve_rescue_hatch_null.RData"))
+} else {
+  
+  model_adameve_rescue_hatch_null <- brm(TotalNymphs | trials(TotalEggs) ~ 1 + 
+                                Time + (1|LayMonth_Cal),
+                              data=tmp_modelling,
+                              seed=23569245,
+                              family=binomial(),
+                              chains=4,cores=2,
+                              sample_prior='yes',
+                              warmup=1000,
+                              prior=intercept_slope_prior_hatch,
+                              silent=2,
+                              refresh=0)
+  
+  save(model_adameve_rescue_hatch_null,
+       file=paste0(DATA_DIR,"/brms_models/model_adameve_rescue_hatch_null.RData"))
+  
+}
+  
+if(file.exists(paste0(DATA_DIR,"/brms_models/model_adameve_rescue_hatch_event0.RData"))){
+  load(paste0(DATA_DIR,"/brms_models/model_adameve_rescue_hatch_event0.RData"))
+} else {
+
+  model_adameve_rescue_hatch_event0 <- brm(TotalNymphs | trials(TotalEggs) ~ 1 + 
+                                       Time + (1|LayMonth_Cal) +
+                                       Rescue_TimeSince_0,
+                                     data=tmp_modelling,
+                                     seed=23569245,
+                                     family=binomial(),
+                                     chains=4,cores=2,
+                                     sample_prior='yes',
+                                     warmup=1000,
+                                     prior=intercept_slope_prior_hatch,
+                                     silent=2,
+                                     refresh=0)
+  
+    save(model_adameve_rescue_hatch_event0,
+       file=paste0(DATA_DIR,"/brms_models/model_adameve_rescue_hatch_event0.RData"))
+  
+}
+
+print("Plotting no event model")
+summary(model_adameve_rescue_hatch_null)
+plot(model_adameve_rescue_hatch_null)
+
+print("=====================================================")
+print("=====================================================")
+
+print("Plotting 0 delay model")
+summary(model_adameve_rescue_hatch_event0)
+plot(model_adameve_rescue_hatch_event0)
+
+
+print("=====================================================")
+print("=====================================================")
+
+print("Comparing model fits with LOO")
+loo_compare(loo(model_adameve_rescue_hatch_null),
+            loo(model_adameve_rescue_hatch_event0))
+
+print("=====================================================")
+print("=====================================================")
+
+print("Comparing model weights with LOO")
+model_weights(model_adameve_rescue_hatch_null,
+            model_adameve_rescue_hatch_event0) * 100
+print("=====================================================")
+print("=====================================================")
+
+print("Comparing model weights with WAIC")
+model_weights(model_adameve_rescue_hatch_null,
+            model_adameve_rescue_hatch_event0,
+              weights = "waic") * 100
+
+```
+
+Here, there is a lot of weight and WAIC given to the model with Vanessa's influence included. However, the comparison of model weights with LOO shows that the difference between the null model and the event model has a really large standard error. I don't consider this very strong evidence for an effect of any kind.
+
+##### Predictions
+
+```{r adameve_rescue_model_hatch_predictions}
+
+tmp_modelling %>% 
+  add_predicted_draws(ndraws=500,model_adameve_rescue_hatch_null) %>%
+  ggplot(aes(x=Time,y=TotalNymphs/TotalEggs)) + 
+  stat_lineribbon(aes(y=.prediction/TotalEggs), .width = c(.95, .8, .5), color = "#08519C") + 
+  geom_point(data=tmp_modelling,alpha=0.2,aes(size=TotalEggs)) + 
+  scale_fill_brewer() + 
+  labs(title="No event")
+
+tmp_modelling %>% 
+  add_predicted_draws(ndraws=500,model_adameve_rescue_hatch_event0) %>%
+  ggplot(aes(x=Time,y=TotalNymphs/TotalEggs)) + 
+  stat_lineribbon(aes(y=.prediction/TotalEggs), .width = c(.95, .8, .5), color = "#08519C") + 
+  geom_point(data=tmp_modelling,alpha=0.2,aes(size=TotalEggs)) + 
+  scale_fill_brewer() + 
+  labs(title="Event, 0 month delay")
+
+```
+
+Again, similar predictions.
+
+##### Clearing space
+
+```{r adameve_rescue_model_hatch_clearing}
+
+rm(model_adameve_rescue_hatch_null,
+   model_adameve_rescue_hatch_event0)
+
+```
+
+### Plotting
+
+Here, we plot the AdamEve and the LHIP models on top of each other. This will require some fiddling around with the time periods.
+
+```{r rescue_plotting_load_models}
+
+setwd(paste0(DATA_DIR,"/brms_models"))
+files <- list.files()
+lapply(files[grep("model_lhip",files)],load,.GlobalEnv)
+lapply(files[grep("model_adameve_rescue",files)],load,.GlobalEnv)
+
+```
+
+```{r rescue_plotting}
+
+months <- data.frame(LayMonth=1:12,LayMonth_Cal=c("Jan","Feb","Mar",
+                                                  "Apr","May","Jun",
+                                                  "Jul","Aug","Sep",
+                                                  "Oct","Nov","Dec"))
+
+# Get start date of intervention and extract month and year variables
+
+start_date <- min(lhip$LayDate,na.rm=T)
+
+# Subset data to just the time period of interest
+# Also add egg volume
+
+adameve_rescue <- adameve %>% filter(LayDate > (start_date - (365*2)),
+                                     LayDate < (start_date + (365*2)),
+                                     IsSurplus=="N",HasInfo=="Y") %>%
+  mutate(EggVolume = EggLength * (EggWidth/2)^2 * pi)
+rescue0 <- get_event_column(9,2019,adameve_rescue,"Rescue",0)
+colnames(rescue0)[3:4] <- paste0(colnames(rescue0)[3:4],"_0")
+
+time <- adameve_rescue %>%
+  group_by(LayYear,LayMonth) %>%
+  slice_sample(n=1) %>%
+  select(LayYear,LayMonth) %>%
+  ungroup() %>%
+  arrange(LayYear,LayMonth) %>%
+  mutate(Time=1:n()) %>%
+  merge(months)
+
+#lhip_col <- colours[colours$V1=="LHIP",2]
+lhip_col <- "#46d63c"
+adameve_col <- colours[colours$V1=="AdamEve",2]
+
+### NYMPH LENGTH
+
+# Make new data.frames for plotting
+
+adameve_tmp_points <- merge(rescue0,time) %>%
+  merge(adameve_rescue) %>%
+  filter(!is.na(NymphLength)) %>%
+  select(NymphLength,LayMonth_Cal,LayMonth,Time,Rescue_TimeSince_0,LayYear,ID)
+
+lhip_tmp_points <- lhip %>%
+  filter(IsSurplus=="N",HasInfo=="Y",!is.na(NymphLength)) %>%
+  select(LayMonth,LayYear,NymphLength,ID)
+tmp <- lhip_tmp_points %>% 
+  select(LayYear,LayMonth) %>%
+  group_by(LayYear,LayMonth) %>%
+  dplyr::slice_sample(n=1) %>% ungroup %>%
+  arrange(LayYear,LayMonth) %>%
+  mutate(Time = 1:n())
+lhip_tmp_points <- merge(lhip_tmp_points,tmp) %>%
+  merge(months)
+
+# Now make data.frames with predictions
+adameve_tmp_pred <- adameve_tmp_points %>%
+  add_epred_draws(ndraws=500,model_adameve_rescue_nymph_null,newdata=.)
+lhip_tmp_pred <- lhip_tmp_points %>% 
+  add_epred_draws(ndraws=500,model_lhip_nymph,newdata=.)
+
+# Use the ID columns to add back the original dates for plotting
+lhip_dates <- lhip %>% select(ID,LayDate)
+lhip_tmp_points <- merge(lhip_dates,lhip_tmp_points) %>% filter(LayDate < "2020-11-01")
+lhip_tmp_pred <- merge(lhip_dates,lhip_tmp_pred) %>% filter(LayDate < "2020-11-01")
+adameve_dates <- adameve %>% select(ID,LayDate)
+adameve_tmp_points <- merge(adameve_dates,adameve_tmp_points) %>% filter(LayDate < "2020-11-01")
+adameve_tmp_pred <- merge(adameve_dates,adameve_tmp_pred) %>% filter(LayDate < "2020-11-01")
+
+p1 <- ggplot() + 
+  geom_point(data=adameve_tmp_points,
+               mapping=aes(x=LayDate,y=NymphLength),
+              colour="darkgrey",alpha=0.25) + 
+     geom_point(data=lhip_tmp_points,
+                mapping=aes(x=LayDate,y=NymphLength),
+              colour="darkgrey",alpha=0.25) + 
+  stat_lineribbon(data=adameve_tmp_pred,
+                  mapping=aes(x=LayDate,y=.epred),
+                  .width = c(.95,0.8,0.5), color = adameve_col,fill=adameve_col,alpha=0.25,size=2) +
+       stat_lineribbon(data=lhip_tmp_pred,
+                   mapping=aes(x=LayDate,y=.epred),
+                   .width = c(.95,0.8,0.5), color = lhip_col,fill=lhip_col,alpha=0.35,size=2) +
+  scale_fill_brewer() + 
+  theme_bw() + 
+  theme(axis.ticks=element_blank(),
+        panel.grid=element_blank(),
+        axis.title.y=element_text(angle=0,vjust=0.5)) + 
+     stat_lineribbon(data=lhip_tmp_pred,
+                   mapping=aes(x=LayDate,y=.epred),
+                   .width = c(.95,0.8,0.5), color = lhip_col,fill=lhip_col,alpha=0.3,size=2) +
+  labs(y="Nymph\nlength",x="Laying date") +
+  scale_y_continuous(limits=c(15,22)) + 
+  scale_x_date(limits=as.Date(c("2017-02-01","2020-11-16")),expand=c(0,0))
+
+# Now make data.frames with predictions
+adameve_tmp_pred <- adameve_tmp_points %>%
+  add_predicted_draws(ndraws=500,model_adameve_rescue_nymph_null,newdata=.)
+lhip_tmp_pred <- lhip_tmp_points %>% 
+  add_predicted_draws(ndraws=500,model_lhip_nymph,newdata=.)
+lhip_dates <- lhip %>% select(ID,LayDate)
+lhip_tmp_points <- merge(lhip_dates,lhip_tmp_points) %>% filter(LayDate < "2020-11-01")
+lhip_tmp_pred <- merge(lhip_dates,lhip_tmp_pred) %>% filter(LayDate < "2020-11-01")
+adameve_dates <- adameve %>% select(ID,LayDate)
+adameve_tmp_points <- merge(adameve_dates,adameve_tmp_points) %>% filter(LayDate < "2020-11-01")
+adameve_tmp_pred <- merge(adameve_dates,adameve_tmp_pred) %>% filter(LayDate < "2020-11-01")
+
+tmp1 <- adameve_tmp_pred %>% ungroup %>% filter(Time==max(Time)) %>%
+  select(.prediction) %>% mutate(Line="AdamEve")
+tmp2 <- lhip_tmp_pred %>% ungroup %>% filter(Time==max(Time)) %>%
+  select(.prediction) %>% mutate(Line="LHIP")
+p1.2 <- rbind(tmp1,tmp2) %>%
+  ggplot(aes(y=.prediction,fill=Line)) + 
+  stat_pointinterval(.width=c(0.95,0.8,0.5),pch=21,position=position_dodge(width = 0.5),fatten_point=3) + 
+  theme_void() + 
+  theme(legend.position="none") +
+  scale_y_continuous(limits=c(15,22)) + 
+  scale_fill_manual(breaks=c("LHIP","AdamEve"),values=colours[,2])
+
+### EGG VOLUME
+
+# Make new data.frames for plotting
+
+adameve_tmp_points <- merge(rescue0,time) %>%
+  merge(adameve_rescue) %>%
+  filter(!is.na(EggVolume)) %>%
+  select(EggVolume,LayMonth_Cal,LayMonth,Time,Rescue_TimeSince_0,LayYear,ID)
+
+lhip_tmp_points <- lhip %>%
+  mutate(EggVolume = EggLength * (EggWidth/2)^2 * pi) %>%
+  filter(IsSurplus=="N",HasInfo=="Y",!is.na(EggVolume)) %>%
+  select(LayMonth,LayYear,EggVolume,ID)
+tmp <- lhip_tmp_points %>% 
+  select(LayYear,LayMonth) %>%
+  group_by(LayYear,LayMonth) %>%
+  dplyr::slice_sample(n=1) %>% ungroup %>%
+  arrange(LayYear,LayMonth) %>%
+  mutate(Time = 1:n())
+lhip_tmp_points <- merge(lhip_tmp_points,tmp) %>%
+  merge(months)
+
+# Now make data.frames with predictions
+
+adameve_tmp_pred <- adameve_tmp_points %>%
+  add_epred_draws(ndraws=500,model_adameve_rescue_ev_null,newdata=.)
+
+lhip_tmp_pred <- lhip_tmp_points %>% 
+  add_epred_draws(ndraws=500,model_lhip_ev,newdata=.)
+
+# Use the ID columns to add back the original dates for plotting
+lhip_dates <- lhip %>% select(ID,LayDate)
+lhip_tmp_points <- merge(lhip_dates,lhip_tmp_points) %>% filter(LayDate < "2020-11-01")
+lhip_tmp_pred <- merge(lhip_dates,lhip_tmp_pred) %>% filter(LayDate < "2020-11-01")
+adameve_dates <- adameve %>% select(ID,LayDate)
+adameve_tmp_points <- merge(adameve_dates,adameve_tmp_points) %>% filter(LayDate < "2020-11-01")
+adameve_tmp_pred <- merge(adameve_dates,adameve_tmp_pred) %>% filter(LayDate < "2020-11-01")
+
+p2 <- ggplot() + 
+  geom_point(data=adameve_tmp_points,
+               mapping=aes(x=LayDate,y=EggVolume),
+              colour="darkgrey",alpha=0.25) + 
+     geom_point(data=lhip_tmp_points,
+                mapping=aes(x=LayDate,y=EggVolume),
+              colour="darkgrey",alpha=0.25) + 
+  stat_lineribbon(data=adameve_tmp_pred,
+                  mapping=aes(x=LayDate,y=.epred),
+                  .width = c(.95,0.8,0.5), color = adameve_col,fill=adameve_col,alpha=0.25,size=2) +
+       stat_lineribbon(data=lhip_tmp_pred,
+                   mapping=aes(x=LayDate,y=.epred),
+                   .width = c(.95,0.8,0.5), color = lhip_col,fill=lhip_col,alpha=0.35,size=2)  +
+  scale_fill_brewer() + 
+  theme_bw() + 
+  theme(axis.ticks=element_blank(),
+        panel.grid=element_blank(),
+       axis.title.y=element_text(angle=0,vjust=0.5)) + 
+  labs(y="Egg\nvolume",x="Laying date") +
+  scale_y_continuous(limits=c(45,105)) + 
+  scale_x_date(limits=as.Date(c("2017-02-01","2020-11-16")),expand=c(0,0))
+
+
+adameve_tmp_pred <- adameve_tmp_points %>%
+  add_predicted_draws(ndraws=500,model_adameve_rescue_ev_null,newdata=.)
+lhip_tmp_pred <- lhip_tmp_points %>% 
+  add_predicted_draws(ndraws=500,model_lhip_ev,newdata=.)
+lhip_dates <- lhip %>% select(ID,LayDate)
+lhip_tmp_points <- merge(lhip_dates,lhip_tmp_points) %>% filter(LayDate < "2020-11-01")
+lhip_tmp_pred <- merge(lhip_dates,lhip_tmp_pred) %>% filter(LayDate < "2020-11-01")
+adameve_dates <- adameve %>% select(ID,LayDate)
+adameve_tmp_points <- merge(adameve_dates,adameve_tmp_points) %>% filter(LayDate < "2020-11-01")
+adameve_tmp_pred <- merge(adameve_dates,adameve_tmp_pred) %>% filter(LayDate < "2020-11-01")
+
+tmp1 <- adameve_tmp_pred %>% ungroup %>% filter(Time==max(Time)) %>%
+  select(.prediction) %>% mutate(Line="AdamEve")
+tmp2 <- lhip_tmp_pred %>% ungroup %>% filter(Time==max(Time)) %>%
+  select(.prediction) %>% mutate(Line="LHIP")
+p2.2 <- rbind(tmp1,tmp2) %>%
+  ggplot(aes(y=.prediction,fill=Line)) + 
+  stat_pointinterval(.width=c(0.95,0.8,0.5),pch=21,position=position_dodge(width = 0.5),fatten_point=3) + 
+  theme_void() + 
+  theme(legend.position="none") +
+  scale_y_continuous(limits=c(45,105)) + 
+  scale_fill_manual(breaks=c("LHIP","AdamEve"),values=colours[,2])
+
+### HATCH RATE
+
+# See AdamEve_Rescue models for explanation of thiscode
+start_date <- min(lhip$LayDate,na.rm=T)
+adameve_rescue <- adameve %>% filter(LayDate > (start_date - (365*2)),
+                                     LayDate < (start_date + (365*2)),
+                                     IsSurplus=="N",HasInfo=="Y") %>%
+  group_by(LayDate) %>%
+  summarise(TotalEggs = n(),
+            TotalNymphs=sum(!is.na(NymphLength)),
+            LayMonth=first(LayMonth),
+            LayYear=first(LayYear))
+rescue0 <- get_event_column(9,2019,adameve_rescue,"Rescue",0)
+colnames(rescue0)[3:4] <- paste0(colnames(rescue0)[3:4],"_0")
+
+# Make new data.frames for plotting
+
+adameve_tmp_points <- merge(rescue0,time) %>%
+  merge(adameve_rescue) %>%
+  filter(Time < 46) %>%
+  select(TotalEggs,TotalNymphs,LayMonth_Cal,LayMonth,Time,Rescue_TimeSince_0,LayYear,LayDate) %>% 
+  filter(LayDate < "2020-11-01")
+
+lhip_tmp_points <- lhip %>%
+  filter(IsSurplus=="N",HasInfo=="Y") %>%
+  group_by(LayDate) %>%
+  summarise(TotalEggs = n(),
+            TotalNymphs=sum(!is.na(NymphLength)),
+            LayMonth=first(LayMonth),
+            LayYear=first(LayYear)) %>%
+  select(TotalEggs,TotalNymphs,LayMonth,LayYear,LayDate)
+tmp <- lhip_tmp_points %>% 
+  select(LayYear,LayMonth) %>%
+  group_by(LayYear,LayMonth) %>%
+  dplyr::slice_sample(n=1) %>% ungroup %>%
+  arrange(LayYear,LayMonth) %>%
+  mutate(Time = 1:n())
+lhip_tmp_points <- merge(lhip_tmp_points,tmp) %>%
+  merge(months) %>% 
+  filter(LayDate < "2020-11-01")
+
+# Now make data.frames with predictions
+
+adameve_tmp_pred <- adameve_tmp_points %>%
+  add_epred_draws(ndraws=500,model_adameve_rescue_hatch_null,newdata=.) %>% 
+  filter(LayDate < "2020-11-01")
+
+lhip_tmp_pred <- lhip_tmp_points %>% 
+  add_epred_draws(ndraws=500,model_lhip_hatch_changepoint,newdata=.) %>% 
+  filter(LayDate < "2020-11-01")
+
+p4 <- ggplot() + 
+  geom_point(data=adameve_tmp_points,
+               mapping=aes(x=LayDate,y=TotalNymphs/TotalEggs,size=TotalEggs),
+              colour="darkgrey",alpha=0.25) + 
+     geom_point(data=lhip_tmp_points,
+               mapping=aes(x=LayDate,y=TotalNymphs/TotalEggs,size=TotalEggs),
+              colour="darkgrey",alpha=0.25) + 
+     geom_point(data=lhip_tmp_points,
+               mapping=aes(x=LayDate,y=TotalNymphs/TotalEggs),
+              colour="darkgrey",alpha=0.1) + 
+  stat_lineribbon(data=adameve_tmp_pred,
+                  mapping=aes(x=LayDate,y=.epred/TotalEggs),
+                  .width = c(.95,0.8,0.5), color = adameve_col,fill=adameve_col,alpha=0.25,size=2) +
+       stat_lineribbon(data=lhip_tmp_pred,
+                  mapping=aes(x=LayDate,y=.epred/TotalEggs),
+                  .width = c(.95,0.8,0.5), color = lhip_col,fill=lhip_col,alpha=0.35,size=2) +
+  scale_fill_brewer() + 
+  theme_bw() + 
+  theme(axis.ticks=element_blank(),
+        panel.grid=element_blank(),
+        axis.title.y=element_text(angle=0,vjust=0.5),
+        legend.position="none") + 
+  labs(y="Hatch\nrate",x="Laying date") + 
+  scale_y_continuous(limits=c(0,1)) + 
+  scale_x_date(limits=as.Date(c("2017-02-01","2020-11-16")),expand=c(0,0))
+
+adameve_tmp_pred <- adameve_tmp_points %>%
+  add_predicted_draws(ndraws=500,model_adameve_rescue_hatch_null,newdata=.) %>% 
+  filter(LayDate < "2020-11-01")
+
+lhip_tmp_pred <- lhip_tmp_points %>% 
+  add_predicted_draws(ndraws=500,model_lhip_hatch_changepoint,newdata=.) %>% 
+  filter(LayDate < "2020-11-01")
+
+tmp1 <- adameve_tmp_pred %>% ungroup %>% filter(Time==max(Time)) %>%
+  select(.prediction,TotalEggs) %>% mutate(Line="AdamEve")
+tmp2 <- lhip_tmp_pred %>% ungroup %>% filter(Time==max(Time)) %>%
+  select(.prediction,TotalEggs) %>% mutate(Line="LHIP")
+p4.2 <- rbind(tmp1,tmp2) %>%
+  ggplot(aes(y=.prediction/TotalEggs,fill=Line)) + 
+  stat_pointinterval(.width=c(0.95,0.8,0.5),pch=21,
+                     position=position_dodge(width = 0.5),fatten_point=3,
+                     point_interval="mean_qi") + 
+  theme_void() + 
+  theme(legend.position="none") + 
+  scale_y_continuous(limits=c(0,1)) + 
+  scale_fill_manual(breaks=c("LHIP","AdamEve"),values=colours[,2])
+
+
+p <- 
+  (p4 + theme(axis.title.x=element_blank(),axis.text.x=element_blank())) + p4.2 + 
+  (p1 + theme(axis.title.x=element_blank(),axis.text.x=element_blank())) + p1.2 +
+  p2 + p2.2 + plot_layout(widths=c(9,1),heights=c(2,1,1))
+
+png(paste0(FIGURE_DIR,"/rescue_predictions.png"),res=300,width=8,height=10,units='in')
+plot(p)
+dev.off()
+
+
+```
+
+We also plot both hatch models here for comparisons
+
+```{r rescue_plotting_hatch_comparison}
+
+months <- data.frame(LayMonth=1:12,LayMonth_Cal=c("Jan","Feb","Mar",
+                                                  "Apr","May","Jun",
+                                                  "Jul","Aug","Sep",
+                                                  "Oct","Nov","Dec"))
+
+### HATCH RATE
+
+# See AdamEve_Rescue models for explanation of thiscode
+start_date <- min(lhip$LayDate,na.rm=T)
+adameve_rescue <- adameve %>% filter(LayDate > (start_date - (365*2)),
+                                     LayDate < (start_date + (365*2)),
+                                     IsSurplus=="N",HasInfo=="Y") %>%
+  group_by(LayDate) %>%
+  summarise(TotalEggs = n(),
+            TotalNymphs=sum(!is.na(NymphLength)),
+            LayMonth=first(LayMonth),
+            LayYear=first(LayYear))
+rescue0 <- get_event_column(9,2019,adameve_rescue,"Rescue",0)
+colnames(rescue0)[3:4] <- paste0(colnames(rescue0)[3:4],"_0")
+
+# Make new data.frames for plotting
+
+adameve_tmp_points <- merge(rescue0,time) %>%
+  merge(adameve_rescue) %>%
+  filter(Time < 46) %>%
+  select(TotalEggs,TotalNymphs,LayMonth_Cal,LayMonth,Time,Rescue_TimeSince_0,LayYear,LayDate) %>% 
+  filter(LayDate < "2020-11-01")
+
+lhip_tmp_points <- lhip %>%
+  filter(IsSurplus=="N",HasInfo=="Y") %>%
+  group_by(LayDate) %>%
+  summarise(TotalEggs = n(),
+            TotalNymphs=sum(!is.na(NymphLength)),
+            LayMonth=first(LayMonth),
+            LayYear=first(LayYear)) %>%
+  select(TotalEggs,TotalNymphs,LayMonth,LayYear,LayDate)
+tmp <- lhip_tmp_points %>% 
+  select(LayYear,LayMonth) %>%
+  group_by(LayYear,LayMonth) %>%
+  dplyr::slice_sample(n=1) %>% ungroup %>%
+  arrange(LayYear,LayMonth) %>%
+  mutate(Time = 1:n())
+lhip_tmp_points <- merge(lhip_tmp_points,tmp) %>%
+  merge(months) %>% 
+  filter(LayDate < "2020-11-01")
+
+# Now make data.frames with predictions
+
+adameve_tmp_pred <- adameve_tmp_points %>%
+  add_epred_draws(ndraws=500,model_adameve_rescue_hatch_null,newdata=.) %>% 
+  filter(LayDate < "2020-11-01")
+
+lhip_tmp_pred <- lhip_tmp_points %>% 
+  add_epred_draws(ndraws=500,model_lhip_hatch_changepoint,newdata=.) %>% 
+  filter(LayDate < "2020-11-01")
+
+p1 <- ggplot() + 
+  geom_point(data=adameve_tmp_points,
+               mapping=aes(x=LayDate,y=TotalNymphs/TotalEggs,size=TotalEggs),
+              colour="darkgrey",alpha=0.25) + 
+     geom_point(data=lhip_tmp_points,
+               mapping=aes(x=LayDate,y=TotalNymphs/TotalEggs,size=TotalEggs),
+              colour="darkgrey",alpha=0.25) + 
+     geom_point(data=lhip_tmp_points,
+               mapping=aes(x=LayDate,y=TotalNymphs/TotalEggs),
+              colour="darkgrey",alpha=0.1) + 
+  stat_lineribbon(data=adameve_tmp_pred,
+                  mapping=aes(x=LayDate,y=.epred/TotalEggs),
+                  .width = c(.95,0.8,0.5), color = adameve_col,fill=adameve_col,alpha=0.25,size=2) +
+       stat_lineribbon(data=lhip_tmp_pred,
+                  mapping=aes(x=LayDate,y=.epred/TotalEggs),
+                  .width = c(.95,0.8,0.5), color = lhip_col,fill=lhip_col,alpha=0.35,size=2) +
+  scale_fill_brewer() + 
+  theme_bw() + 
+  theme(axis.ticks=element_blank(),
+        panel.grid=element_blank(),
+        axis.title.y=element_text(angle=0,vjust=0.5),
+        legend.position="none") + 
+  labs(y="Hatch\nrate",x="Laying date") + 
+  scale_y_continuous(limits=c(0,1)) + 
+  scale_x_date(limits=as.Date(c("2017-02-01","2020-11-16")),expand=c(0,0))
+
+adameve_tmp_pred <- adameve_tmp_points %>%
+  add_predicted_draws(ndraws=500,model_adameve_rescue_hatch_null,newdata=.) %>% 
+  filter(LayDate < "2020-11-01")
+
+lhip_tmp_pred <- lhip_tmp_points %>% 
+  add_predicted_draws(ndraws=500,model_lhip_hatch_changepoint,newdata=.) %>% 
+  filter(LayDate < "2020-11-01")
+
+tmp1 <- adameve_tmp_pred %>% ungroup %>% filter(Time==max(Time)) %>%
+  select(.prediction,TotalEggs) %>% mutate(Line="AdamEve")
+tmp2 <- lhip_tmp_pred %>% ungroup %>% filter(Time==max(Time)) %>%
+  select(.prediction,TotalEggs) %>% mutate(Line="LHIP")
+p1.2 <- rbind(tmp1,tmp2) %>%
+  ggplot(aes(y=.prediction/TotalEggs,fill=Line)) + 
+  stat_pointinterval(.width=c(0.95,0.8,0.5),pch=21,
+                     position=position_dodge(width = 0.5),fatten_point=3,
+                     point_interval="mean_qi") + 
+  theme_void() + 
+  theme(legend.position="none") + 
+  scale_y_continuous(limits=c(0,1)) + 
+  scale_fill_manual(breaks=c("LHIP","AdamEve"),values=colours[,2])
+
+adameve_tmp_pred <- adameve_tmp_points %>%
+  add_epred_draws(ndraws=500,model_adameve_rescue_hatch_null,newdata=.) %>% 
+  filter(LayDate < "2020-11-01")
+
+lhip_tmp_pred <- lhip_tmp_points %>% 
+  add_epred_draws(ndraws=500,model_lhip_hatch,newdata=.) %>% 
+  filter(LayDate < "2020-11-01")
+
+p2 <- ggplot() + 
+  geom_point(data=adameve_tmp_points,
+               mapping=aes(x=LayDate,y=TotalNymphs/TotalEggs,size=TotalEggs),
+              colour="darkgrey",alpha=0.25) + 
+     geom_point(data=lhip_tmp_points,
+               mapping=aes(x=LayDate,y=TotalNymphs/TotalEggs,size=TotalEggs),
+              colour="darkgrey",alpha=0.25) + 
+     geom_point(data=lhip_tmp_points,
+               mapping=aes(x=LayDate,y=TotalNymphs/TotalEggs),
+              colour="darkgrey",alpha=0.1) + 
+  stat_lineribbon(data=adameve_tmp_pred,
+                  mapping=aes(x=LayDate,y=.epred/TotalEggs),
+                  .width = c(.95,0.8,0.5), color = adameve_col,fill=adameve_col,alpha=0.25,size=2) +
+       stat_lineribbon(data=lhip_tmp_pred,
+                  mapping=aes(x=LayDate,y=.epred/TotalEggs),
+                  .width = c(.95,0.8,0.5), color = lhip_col,fill=lhip_col,alpha=0.35,size=2) +
+  scale_fill_brewer() + 
+  theme_bw() + 
+  theme(axis.ticks=element_blank(),
+        panel.grid=element_blank(),
+        axis.title.y=element_text(angle=0,vjust=0.5),
+        legend.position="none") + 
+  labs(y="Hatch\nrate",x="Laying date") + 
+  scale_y_continuous(limits=c(0,1)) + 
+  scale_x_date(limits=as.Date(c("2017-02-01","2020-11-16")),expand=c(0,0))
+
+adameve_tmp_pred <- adameve_tmp_points %>%
+  add_predicted_draws(ndraws=500,model_adameve_rescue_hatch_null,newdata=.) %>% 
+  filter(LayDate < "2020-11-01")
+
+lhip_tmp_pred <- lhip_tmp_points %>% 
+  add_predicted_draws(ndraws=500,model_lhip_hatch_changepoint,newdata=.) %>% 
+  filter(LayDate < "2020-11-01")
+
+tmp1 <- adameve_tmp_pred %>% ungroup %>% filter(Time==max(Time)) %>%
+  select(.prediction,TotalEggs) %>% mutate(Line="AdamEve")
+tmp2 <- lhip_tmp_pred %>% ungroup %>% filter(Time==max(Time)) %>%
+  select(.prediction,TotalEggs) %>% mutate(Line="LHIP")
+p2.2 <- rbind(tmp1,tmp2) %>%
+  ggplot(aes(y=.prediction/TotalEggs,fill=Line)) + 
+  stat_pointinterval(.width=c(0.95,0.8,0.5),pch=21,
+                     position=position_dodge(width = 0.5),fatten_point=3,
+                     point_interval="mean_qi") + 
+  theme_void() + 
+  theme(legend.position="none") + 
+  scale_y_continuous(limits=c(0,1)) + 
+  scale_fill_manual(breaks=c("LHIP","AdamEve"),values=colours[,2])
+
+
+
+p <- 
+  (p1 + theme(axis.title.x=element_blank(),axis.text.x=element_blank())) + p1.2 +
+  p2 + p2.2 + plot_layout(widths=c(9,1),heights=c(1,1))
+
+png(paste0(FIGURE_DIR,"/rescue_predictions_no_changepoint.png"),res=300,width=8,height=6,units='in')
+plot(p)
+dev.off()
+
+
+```
+
+
+```{r legend_figure}
+
+png(paste0(FIGURE_DIR,"/FINALFIG.png"),res=300,width=8,height=10,units='in')
+plot(p)
+dev.off()
+
+# Save legend figure as well
+l <- data.frame(val=c(1,1),Line=c("AdamEve","LHIP")) %>% 
+  ggplot(aes(x=val,y=val,fill=Line)) + 
+  geom_point() + 
+  guides(fill = guide_legend(override.aes = list(shape=22,size=5))) + 
+  theme(legend.key = element_blank()) + 
+  scale_fill_manual(breaks=c("LHIP","AdamEve"),values=colours[,2])
+l <- get_legend(l)
+
+png(paste0(FIGURE_DIR,"/LEGENDFIG.png"),res=300,width=2,height=2,units='in')
+plot(l)
+dev.off()
+
+
+```
+
+
+

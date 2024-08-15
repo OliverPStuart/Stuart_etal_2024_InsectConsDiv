@@ -1,0 +1,296 @@
+---
+title: "LHISI Phenotype Data - Preparation and Cleaning"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+library(knitr)
+opts_chunk$set(echo = TRUE,
+               warning = FALSE,
+               message = FALSE,
+               fig.width=12, fig.height=8)
+```
+
+# Preface {.tabset}
+
+This document contains all of the computational cleaning done to the LHISI phenotype data. Prior to being loaded into R, Excel spreadsheets collated by hand and from ZIMS were manually parsed and combined into a single spreadsheet. I do not describe in detail in this document the methods used for collating all of the data. Here, we load the data from the spreadsheet and explore and analyse it.
+
+Data is recorded in full until December of 2020. At the zoo, paper datasheets are kept with eggs until they hatch, at which point they are entered into ZIMS. Data were first collated in June of 2021, and so only eggs which had hatched by this point were included in the ZIMS data provided. This corresponds to eggs lain towards the end of 2020. The very final hatching date is 18/06/2021. The data is divided into five captive lines which have different but sometimes interacting histories
+
+Each line has its own analysis section for data exploration and cleaning, as each line occupies its own separate sheet in the original Excel file.
+
+## Setup
+
+Library loading.
+
+```{r library_loading, warning=FALSE,messsage=FALSE}
+library(dplyr,        warn.conflicts = F)
+library(magrittr,     warn.conflicts = F)
+library(ggplot2,      warn.conflicts = F)
+library(cowplot,      warn.conflicts = F)
+library(RColorBrewer, warn.conflicts = F)
+library(patchwork,    warn.conflicts = F)
+library(GGally,       warn.conflicts = F)
+library(readxl,       warn.conflicts = F)
+library(kableExtra,   warn.conflicts = F)
+```
+
+Set working directory.
+
+```{r set_environment}
+source("../config.R")
+setwd(WORKING_DIR)
+```
+
+## Initial exploration {.tabset}
+
+In this tab, we load, reformat, briefly filter, and then do some initial exploration of the data. Several operations are performed on each of the data sets, one for each of the captive lines.
+
+First, a number of pre-processing and formatting steps are required:
+
+Some initial hard filtering is done to remove improbable values. For example, we don't want any negative values. We also don't want any extreme values. The motivation for this hard filter is the presence of very low hatch times for some records. It's not obvious where the error was in these cases. For all of the measurement variables, we simply remove negative values, if there are any. For the hatch time variable, we implement a lower bound of 150 (roughly 5 months) and this is based on dissections we have done previously. Dissections of one line revealed that most individuals are fully developed at 6 months, even if they don't hatch yet. At 5 months the dissected individuals were not fully developed but had yolk remaining to be metabolised. However, we expect to see a fair amount of variation in the hatch rate and this was a relatively small sample. Values lower than this bound are recoded to NA. This only removes a very small number of records.
+
+Then we make some plots:
+
+* Plot histograms of each of five numeric variables of interest
+* Generate a large pairs plot showing correlations between them all
+* Plot the distribution of these variables over time to check patchiness
+* Generate a summary table with stats for each of the variables
+
+The aim of this tab is simply to provide a basic visual overview of the data we're working with.
+
+Some lines will have additional data that others will not, e.g. the LHISI line has data on the number of eggs laid per batch and the number of females/males in the cage at the time.
+
+### ADAMEVE
+
+This line is a free-ranging population begun in 2008 with eggs from LHISI. Generations are overlapping.
+
+```{r adameve_readin}
+# Read in data
+
+adameve <- suppressWarnings(read_excel(paste0(DATA_DIR,"/CombinedData.xlsx"),sheet="ADAMEVE"))
+
+# Reformat some lines as numeric
+
+adameve <- adameve %>% mutate_at(c("HatchMonth","HatchYear","LayMonth","LayYear",
+                                   "NymphLength","EggsInBatch","Group",
+                                   "EggLength","EggWeight","EggWidth",
+                                   "Gen"),as.numeric)
+# Reformat dates as dates
+# In the spreadsheet they are stored as YYYYMMDD, a string of digits eg 20061028
+# This is done to stop Excel from reformatting dates
+
+adameve$HatchDate <- as.Date(as.character(adameve$HatchDate),"%Y%m%d")
+adameve$LayDate <- as.Date(as.character(adameve$LayDate),"%Y%m%d")
+
+# Now make the hatch time variable
+
+adameve$HatchTime <- as.numeric(adameve$HatchDate - adameve$LayDate)
+
+# Remove duplicates
+
+adameve <- adameve %>% filter(Duplicate == "N")
+
+# Add in ID column for later
+
+adameve$ID <- paste0("adameve_",1:nrow(adameve)) 
+
+# Filter out hatch times below 150
+
+too_low <- adameve$HatchTime < 150 ; print(paste0("Number of too-early hatch times is ",
+                                                  sum(too_low,na.rm=T),
+                                                  " of ",
+                                                  nrow(adameve),
+                                                  " total."))
+adameve$HatchTime[too_low] <- NA
+
+# Now, we filter anything that has "FLAGGED, REMOVE" in the OtherNote column
+
+adameve <- adameve[!grepl("FLAGGED",adameve$OtherNote),]
+
+```
+
+```{r adameve_histogram}
+ggplot(adameve) + geom_histogram(aes(x=HatchTime,fill=IsSurplus),bins=50)
+ggplot(adameve) + geom_histogram(aes(x=NymphLength,fill=IsSurplus),bins=50)
+ggplot(adameve) + geom_histogram(aes(x=EggWeight,fill=IsSurplus),bins=50)
+ggplot(adameve) + geom_histogram(aes(x=EggWidth,fill=IsSurplus),bins=50)
+ggplot(adameve) + geom_histogram(aes(x=EggLength,fill=IsSurplus),bins=50)
+```
+
+```{r adameve_corrplot}
+adameve %>% 
+  dplyr::select(HatchTime,NymphLength,EggLength,EggWidth,EggWeight) %>%
+  mutate_at("HatchTime",as.numeric) %>%
+  ggpairs()
+```
+
+```{r adameve_over_time_check_surplus}
+adameve %>% 
+  dplyr::select(HatchTime,NymphLength,EggLength,EggWidth,EggWeight,LayDate,IsSurplus) %>%
+  tidyr::gather(key="Variable",value="Value",-LayDate,-IsSurplus) %>%
+  ggplot() + 
+  geom_point(aes(x=LayDate,y=Value,colour=IsSurplus)) + 
+  facet_grid(Variable~.,scales="free_y") + 
+  geom_smooth(inherit.aes=F,mapping=aes(x=LayDate,y=Value),span=1)
+```
+
+We should also plot these with glasshouse coloured. This might give us some good breakpoints.
+
+```{r adameve_over_time_check_glasshouse}
+adameve %>% 
+  dplyr::select(HatchTime,NymphLength,EggLength,EggWidth,EggWeight,LayDate,Glasshouse) %>%
+  tidyr::gather(key="Variable",value="Value",-LayDate,-Glasshouse) %>%
+  arrange(Glasshouse) %>%
+  ggplot() + 
+  geom_point(aes(x=LayDate,y=Value,colour=Glasshouse)) + 
+  facet_grid(Variable~.,scales="free_y") + 
+  geom_smooth(inherit.aes=F,mapping=aes(x=LayDate,y=Value),span=1)
+```
+
+```{r adameve_summary_table}
+adameve %>% 
+  dplyr::select(HatchTime,NymphLength,EggLength,EggWidth,EggWeight) %>%
+  tidyr::gather(key="Variable",value="Value") %>%
+  group_by(Variable) %>%
+  dplyr::summarise(Nobs=sum(!is.na(Value)),
+                   NAs=sum(is.na(Value)),
+                   Perc_Complete=sum(!is.na(Value)) / n(),
+                   Mean = mean(Value,na.rm=T),
+                   SD = sd(Value,na.rm=T)
+  ) %>%
+  knitr::kable(digits=2) %>% kable_styling(full_width=F)
+```
+
+### LHIP
+
+This is a hybrid line derived from crosses between LHISI and VANESSA individuals and was begun in 2020.
+
+```{r lhip_readin}
+# Read in data
+
+lhip <- suppressWarnings(read_excel(paste0(DATA_DIR,"/CombinedData.xlsx"),sheet="LHIP"))
+
+# Reformat some lines as numeric
+
+lhip <- lhip %>% mutate_at(c("HatchMonth","HatchYear","LayMonth","LayYear",
+                             "NymphLength","EggsInBatch","Group",
+                             "EggLength","EggWeight","EggWidth",
+                             "Gen"),as.numeric)
+# Reformat dates as dates
+# In the spreadsheet they are stored as YYYYMMDD, a string of digits eg 20061028
+# This is done to stop Excel from reformatting dates
+
+lhip$HatchDate <- as.Date(as.character(lhip$HatchDate),"%Y%m%d")
+lhip$LayDate <- as.Date(as.character(lhip$LayDate),"%Y%m%d")
+
+# Now make the hatch time variable
+
+lhip$HatchTime <- as.numeric(lhip$HatchDate - lhip$LayDate)
+
+
+# Remove duplicates
+
+lhip <- lhip %>% filter(Duplicate == "N")
+
+# Add in ID column for later
+
+lhip$ID <- paste0("lhip_",1:nrow(lhip)) 
+
+# Filter out hatch times below 150
+
+too_low <- lhip$HatchTime < 150 ; print(paste0("Number of too-early hatch times is ",
+                                               sum(too_low,na.rm=T),
+                                               " of ",
+                                               nrow(lhip),
+                                               " total."))
+lhip$HatchTime[too_low] <- NA
+
+# Now, we filter anything that has "FLAGGED, REMOVE" in the OtherNote column
+
+lhip <- lhip[!grepl("FLAGGED",lhip$OtherNote),]
+
+```
+
+```{r lhip_histogram}
+ggplot(lhip) + geom_histogram(aes(x=HatchTime,fill=IsSurplus),bins=50)
+ggplot(lhip) + geom_histogram(aes(x=NymphLength,fill=IsSurplus),bins=50)
+ggplot(lhip) + geom_histogram(aes(x=EggWeight,fill=IsSurplus),bins=50)
+ggplot(lhip) + geom_histogram(aes(x=EggWidth,fill=IsSurplus),bins=50)
+ggplot(lhip) + geom_histogram(aes(x=EggLength,fill=IsSurplus),bins=50)
+```
+
+```{r lhip_corrplot}
+lhip %>% 
+  dplyr::select(HatchTime,NymphLength,EggLength,EggWidth,EggWeight) %>%
+  mutate_at("HatchTime",as.numeric) %>%
+  ggpairs()
+```
+
+```{r lhip_over_time_check}
+lhip %>% 
+  dplyr::select(HatchTime,NymphLength,EggLength,EggWidth,EggWeight,LayDate,IsSurplus) %>%
+  tidyr::gather(key="Variable",value="Value",-LayDate,-IsSurplus) %>%
+  ggplot() + 
+  geom_point(aes(x=LayDate,y=Value,colour=IsSurplus)) + 
+  facet_grid(Variable~.,scales="free_y") + 
+  geom_smooth(inherit.aes=F,mapping=aes(x=LayDate,y=Value),span=1)
+```
+
+```{r lhip_summary_table}
+lhip %>% 
+  dplyr::select(HatchTime,NymphLength,EggLength,EggWidth,EggWeight) %>%
+  tidyr::gather(key="Variable",value="Value") %>%
+  group_by(Variable) %>%
+  dplyr::summarise(Nobs=sum(!is.na(Value)),
+                   NAs=sum(is.na(Value)),
+                   Perc_Complete=sum(!is.na(Value)) / n(),
+                   Mean = mean(Value,na.rm=T),
+                   SD = sd(Value,na.rm=T)
+  ) %>%
+  knitr::kable(digits=2) %>% kable_styling(full_width=F)
+```
+
+
+### Temperature and RH Data
+
+We also have records for min/max temperatures as well as relative humidity in a number of glasshouses. The glasshouses where LHISI have been kept (at least the lines we have data for) are 2, 3, 5, 6 and 7. Some of the records have two glasshouses listed, e.g. 5/6 for when a line was split across the two. Glasshouses 2 and 3 have all of their temperature data recorded together, as 2/3. In this tab we look at the resolution of this data.
+
+```{r temperature_data_check}
+
+# Read in data
+temperature <- read_excel(paste0(DATA_DIR,"/CompiledEnvironmentalData.xlsx"),sheet="Sheet1",col_types=c("date",rep("text",7)))
+
+# Select relevant glasshouses and reformat numerics
+temperature <- temperature %>% 
+  filter(Glasshouse %in% c("2&3","4","5","6","7")) %>%
+  select(Date,Glasshouse,MaxT,MinT,RH,EventNote) %>%
+  mutate_at(c("MaxT","MinT","RH"),as.numeric) 
+
+# Find rows where MaxT < MinT and recode to NA
+#temperature %>% filter(MaxT < MinT)
+
+# Date format
+temperature$Date <- as.Date(temperature$Date,format="%d/%m/%Y")
+
+temperature %>% select(Date,MaxT,MinT,Glasshouse) %>%
+  tidyr::gather(key="Bound",value="Temperature",-Date,-Glasshouse) %>%
+  ggplot(aes(x=Date,y=Temperature,colour=Bound)) + 
+  geom_point(alpha=0.2) + 
+  facet_grid(Glasshouse~.) + 
+  scale_y_continuous(limits=c(10,40)) + 
+  guides(color = guide_legend(override.aes = list(size = 2,alpha=1) ) )
+
+temperature %>% 
+  ggplot(aes(x=Date,y=RH)) + 
+  geom_point(alpha=0.2) + 
+  facet_grid(Glasshouse~.) + 
+  scale_y_continuous(limits=c(0,100))
+```
+
+### Saving the data
+
+```{r save_data}
+ save(adameve,lhip,temperature,
+      file=paste0(DATA_DIR,"/cleaned_phenotype_data.R"))
+```
