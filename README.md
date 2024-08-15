@@ -6,3 +6,5 @@ The code is contained in the "Analysis" folder and is divided into two `.Rmd` fi
 
 - `LHISI_Phenotype_Data_Cleaning.Rmd`: here I make some quick summaries of the phenotypic measurements taken from ZIMS and clean any obvious errors.
 - `LHISI_Phenotype_Data_Modelling.Rmd`: all actual modelling and plotting goes here.
+
+The raw data used for both of these analysis scripts is available on request: oliver.stuart93@gmail.com
